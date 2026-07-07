@@ -2,18 +2,27 @@
 FastAPI 服务入口
 
 将命令行版 ChatBI 系统封装为 REST API，供前端或其他服务调用。
+
+第11课增强：
+- 新增 POST /api/v1/query/stream SSE 流式端点
+- 新增 CORS 中间件（前后端分离必须）
+- 挂载 static 目录为静态文件服务（前端 HTML）
+- 保留原有 /api/v1/query 同步端点不动，确保向后兼容
 """
 
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from time import perf_counter
 from typing import Any
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from main import ChatBISystem
@@ -26,10 +35,54 @@ logger = logging.getLogger("chatbi.api")
 
 app = FastAPI(
     title="ChatBI MVP API",
-    version="0.1.0",
-    description="企业级 ChatBI MVP 的服务化接口。"
+    version="0.2.0",
+    description="""
+## ChatBI MVP API
+
+企业级 ChatBI 最小可行产品的服务化接口。
+
+### 接口概览
+
+| 接口 | 方法 | 说明 |
+|------|------|------|
+| `/api/v1/query` | POST | 同步查询，一次性返回完整结果 |
+| `/api/v1/query/stream` | POST | SSE 流式查询，逐步推送 SQL 和结果 |
+| `/health` | GET | 健康检查 |
+
+### SSE 流式接口事件类型
+
+`/api/v1/query/stream` 返回的事件类型：
+
+| 事件类型 | 说明 | data 结构 |
+|----------|------|-----------|
+| `sql_chunk` | SQL 文本片段，前端逐字拼接展示 | `{"content": "SELECT..."}` |
+| `sql_done` | SQL 完整输出，可复制或二次处理 | `{"sql": "SELECT COUNT(*)..."}` |
+| `result` | 查询结果 | `{"columns": [...], "rows": [...], "row_count": N}` |
+| `error` | 异常信息 | `{"error": "...", "error_type": "..."}` |
+
+### Apifox 导入方式
+
+1. 启动服务后访问 `http://localhost:8000/openapi.json`
+2. 在 Apifox 中选择「导入」→「URL 导入」→ 粘贴上面的地址
+3. 或直接复制 JSON 内容，选择「文件导入」
+""",
+    openapi_tags=[
+        {"name": "查询", "description": "自然语言转 SQL 查询接口"},
+        {"name": "系统", "description": "系统运维与监控接口"},
+    ],
 )
 system = ChatBISystem()
+
+# ==================== CORS 中间件 ====================
+# 前后端分离时，浏览器从 localhost:3000/file:// 访问 localhost:8000 会触发跨域限制
+# CORS 中间件允许跨域请求，是前后端联调的必要配置
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],        # 生产环境应限制为具体域名
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 class QueryRequest(BaseModel):
@@ -121,7 +174,7 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
     )
 
 
-@app.get("/")
+@app.get("/", tags=["系统"])
 def read_root() -> dict[str, str]:
     """服务说明入口"""
     return {
@@ -129,10 +182,11 @@ def read_root() -> dict[str, str]:
         "docs": "/docs",
         "health": "/health",
         "query": "/api/v1/query",
+        "query_stream": "/api/v1/query/stream",
     }
 
 
-@app.get("/health", response_model=HealthResponse)
+@app.get("/health", response_model=HealthResponse, tags=["系统"])
 def health_check() -> HealthResponse:
     """检查 API 服务和数据库连通性"""
     return HealthResponse(
@@ -144,6 +198,8 @@ def health_check() -> HealthResponse:
 @app.post(
     "/api/v1/query",
     response_model=QuerySuccessResponse,
+    tags=["查询"],
+    summary="同步查询（一次性返回）",
     responses={
         400: {"model": ErrorResponse, "description": "输入问题不合法"},
         502: {"model": ErrorResponse, "description": "LLM 调用失败"},
@@ -151,7 +207,7 @@ def health_check() -> HealthResponse:
     },
 )
 def query_chatbi(payload: QueryRequest) -> QuerySuccessResponse:
-    """执行自然语言查询，并返回标准化结果"""
+    """执行自然语言查询，并返回标准化结果（同步，一次性返回）"""
     started_at = perf_counter()
     logger.info("Received question: %s", payload.question)
 
@@ -188,6 +244,51 @@ def query_chatbi(payload: QueryRequest) -> QuerySuccessResponse:
         formatted=result["formatted"],
         metadata=metadata,
     )
+
+
+@app.post("/api/v1/query/stream", tags=["查询"], summary="SSE 流式查询（逐步推送）")
+async def query_chatbi_stream(payload: QueryRequest) -> StreamingResponse:
+    """
+    执行自然语言查询，以 SSE 流式返回结果
+
+    SSE 事件类型：
+    - sql_chunk: LLM 流式产出的 SQL 文本片段，前端可逐字拼接展示
+    - sql_done: SQL 完整输出，前端可用于复制或二次处理
+    - result: 查询结果（columns + rows）
+    - error: 异常信息
+
+    每个事件的格式为：
+        event: <type>
+        data: <json>
+    """
+    logger.info("Stream request received: %s", payload.question)
+
+    def event_generator():
+        for event_str in system.run_stream(
+            user_question=payload.question,
+            use_few_shot=payload.use_few_shot,
+            use_rules=payload.use_rules,
+            use_guards=payload.use_guards,
+            use_indicator_knowledge=payload.use_indicator_knowledge,
+        ):
+            yield event_str
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # nginx 环境下禁止缓冲
+        },
+    )
+
+
+# ==================== 静态文件挂载 ====================
+# 将 static/ 目录挂载为 /static 路径，前端 HTML 页面可直接访问
+STATIC_DIR = Path(__file__).parent / "static"
+if STATIC_DIR.is_dir():
+    app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
 if __name__ == "__main__":
