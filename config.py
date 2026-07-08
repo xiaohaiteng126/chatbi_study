@@ -26,6 +26,7 @@ LLM_CONFIG = {
     "api_key": os.getenv("DASHSCOPE_API_KEY"),
     "base_url": os.getenv("BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
     "model": os.getenv("LLM_MODEL", "qwen-turbo"),
+    "embedding_model": os.getenv("EMBEDDING_MODEL", "text-embedding-v1"),
     "temperature": 0.1,
     "max_tokens": 1000
 }
